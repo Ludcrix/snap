@@ -1,0 +1,17 @@
+Génère une histoire courte adaptée à Snapchat.
+
+Contraintes obligatoires :
+- 3 à 4 phrases maximum
+- Phrases courtes et simples
+- Situation sociale réaliste
+- Émotion principale : {EMOTION}
+- Émotions possibles uniquement : injustice, malaise, trahison
+- Aucun nom propre
+- Aucun lieu
+- Aucune date
+- Aucune morale
+- Aucune conclusion explicite
+- Fin ouverte
+- Langage compréhensible par un adolescent
+- Pas d’emojis
+- Pas de mise en forme

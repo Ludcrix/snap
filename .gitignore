@@ -1,0 +1,17 @@
+# Virtual env
+.venv/
+
+# Secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated content
+storage/
+*.mp3
+*.mp4
+
+# Tests
+test_env.py
