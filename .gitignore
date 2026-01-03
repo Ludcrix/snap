@@ -3,6 +3,7 @@
 
 # Secrets
 .env
+.env.anomalie_objet
 
 # Python cache
 __pycache__/

@@ -9,6 +9,13 @@ import requests
 
 from bot.config import TELEGRAM_BOT_TOKEN
 from bot.pipeline import ClipResult, generate_one_clip
+from bot.telegram.publish_assist import (
+    build_publish_caption,
+    build_publish_text_from_clip,
+    ensure_publish_description,
+    get_platform_spec,
+    url_button,
+)
 
 
 THEMES = ["injustice", "malaise", "trahison"]
@@ -36,6 +43,7 @@ class Clip:
     video_path: str
     hook_title: str
     hashtags: list[str]
+    publish_desc: str = ""
     status: str = "pending"  # pending | approved | rejected
     message_chat_id: int | None = None
     message_id: int | None = None
@@ -79,6 +87,7 @@ def _clip_to_dict(c: Clip) -> dict:
         "video_path": c.video_path,
         "hook_title": c.hook_title,
         "hashtags": c.hashtags,
+        "publish_desc": str(getattr(c, "publish_desc", "") or ""),
         "status": c.status,
         "message_chat_id": c.message_chat_id,
         "message_id": c.message_id,
@@ -127,6 +136,7 @@ def _dict_to_state(d: dict) -> ChatState:
                 video_path=str(cd.get("video_path") or ""),
                 hook_title=str(cd.get("hook_title") or ""),
                 hashtags=[str(x) for x in (cd.get("hashtags") or []) if str(x).strip()],
+                publish_desc=str(cd.get("publish_desc") or ""),
                 status=str(cd.get("status") or "pending"),
                 message_chat_id=cd.get("message_chat_id"),
                 message_id=cd.get("message_id"),
@@ -641,6 +651,7 @@ def _list_menu(chat_id: int, which: str):
                 _btn("✅", f"clip:approve:{cid}"),
                 _btn("❌", f"clip:reject:{cid}"),
                 _btn("⬇️", f"clip:later:{cid}"),
+                _btn("🗑️", f"clip:delete:{cid}"),
             ]
         )
 
@@ -649,19 +660,25 @@ def _list_menu(chat_id: int, which: str):
 
 
 def _clip_caption(chat_id: int, clip: Clip) -> str:
-    tags = " ".join(_normalize_hashtags(clip.hashtags))
-    status = clip.status
     st = _state(chat_id)
     pos, total = _queue_position(st, clip.clip_id)
     qp = "-" if pos is None else (f"{pos}/{total}" if total else str(pos))
-    title = _display_title(clip)
-    tags_line = tags if tags else "(no hashtags)"
-    return f"{title}\n{tags_line}\n\nStatus: {status}\nQueue position: {qp}"
+    return build_publish_caption(
+        clip,
+        platform="snap",
+        status_line=f"Status: {clip.status}",
+        queue_line=f"Queue position: {qp}",
+    )
 
 
 def _clip_actions_kb(clip_id: str):
+    spec = get_platform_spec("snap")
     return _kb(
         [
+            [
+                url_button("📤 Publier sur Snap", spec.deeplink),
+                _btn("📋 Copier texte", f"pub:copy:snap:{clip_id}"),
+            ],
             [
                 _btn("✅ Approve", f"clip:approve:{clip_id}"),
                 _btn("❌ Reject", f"clip:reject:{clip_id}"),
@@ -670,9 +687,125 @@ def _clip_actions_kb(clip_id: str):
                 _btn("✏️ Edit text", f"clip:edit:{clip_id}"),
                 _btn("⏸️ Later", f"clip:later:{clip_id}"),
             ],
+            [_btn("🗑️ Delete", f"clip:delete:{clip_id}")],
             [_btn("⬅️ Back", "menu:main")],
         ]
     )
+
+
+def _list_kind_for_clip(clip: Clip) -> str:
+    # queue | approved | rejected
+    if clip.status == "approved":
+        return "approved"
+    if clip.status == "rejected":
+        return "rejected"
+    return "queue"
+
+
+def _ids_for_list(st: ChatState, which: str) -> list[str]:
+    if which == "approved":
+        return list(st.approved_ids)
+    if which == "rejected":
+        return list(st.rejected_ids)
+    return _pending_ids(st)
+
+
+def _pick_next_after(st: ChatState, which: str, current_id: str) -> str | None:
+    ids = _ids_for_list(st, which)
+    try:
+        idx = ids.index(current_id)
+    except ValueError:
+        return ids[0] if ids else None
+    return ids[idx + 1] if idx + 1 < len(ids) else None
+
+
+def _safe_delete_video_file(video_path: str) -> bool:
+    # Only delete files inside storage/videos to avoid deleting arbitrary user files.
+    try:
+        p = Path(video_path)
+        rp = p.resolve()
+        vd = VIDEOS_DIR.resolve()
+        if rp == vd or vd not in rp.parents:
+            return False
+        if rp.is_file():
+            rp.unlink()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _delete_clip_and_open_next(chat_id: int, clip_id: str) -> None:
+    st = _state(chat_id)
+    clip = st.clips.get(clip_id)
+    if not clip:
+        return
+
+    # Decide what "next" means before we mutate state.
+    current_list = _list_kind_for_clip(clip)
+    next_same_list = _pick_next_after(st, current_list, clip_id)
+
+    # Best-effort: delete the video message to keep chat clean.
+    try:
+        if clip.message_chat_id is not None and clip.message_id is not None:
+            _tg_api(
+                "deleteMessage",
+                data={
+                    "chat_id": str(int(clip.message_chat_id)),
+                    "message_id": str(int(clip.message_id)),
+                },
+            )
+    except Exception:
+        pass
+
+    # Remove from state.
+    if st.awaiting_edit_clip_id == clip_id:
+        st.awaiting_edit_clip_id = None
+    st.clips.pop(clip_id, None)
+    st.ordered_ids = [x for x in st.ordered_ids if x != clip_id]
+    st.approved_ids = [x for x in st.approved_ids if x != clip_id]
+    st.rejected_ids = [x for x in st.rejected_ids if x != clip_id]
+    _normalize_state(st)
+    _save_state_locked()
+
+    # Delete file from disk (safe scope).
+    deleted_file = _safe_delete_video_file(clip.video_path)
+
+    # Refresh panels and queue positions.
+    _refresh_pending_positions(chat_id)
+    _refresh_menu(chat_id)
+
+    try:
+        msg = "🗑️ Clip supprimé."
+        if deleted_file:
+            msg += " (vidéo supprimée)"
+        _tg_api("sendMessage", data={"chat_id": str(chat_id), "text": msg})
+    except Exception:
+        pass
+
+    # Open next in same list, else first in same list, else other lists, else main.
+    if next_same_list and next_same_list in st.clips:
+        _send_clip(chat_id, st.clips[next_same_list])
+        return
+
+    remaining_same = _ids_for_list(st, current_list)
+    if remaining_same:
+        first_id = remaining_same[0]
+        c = st.clips.get(first_id)
+        if c:
+            _send_clip(chat_id, c)
+            return
+
+    # Fallback to other lists
+    for which in ["queue", "approved", "rejected"]:
+        ids = _ids_for_list(st, which)
+        if ids:
+            c = st.clips.get(ids[0])
+            if c:
+                _send_clip(chat_id, c)
+                return
+
+    _main_menu(chat_id, force_new=True)
 
 
 def _edit_cancel_kb():
@@ -803,6 +936,23 @@ def _handle_callback(chat_id: int, data: str):
         _main_menu(chat_id, force_new=True)
         return
 
+    if data.startswith("pub:copy:"):
+        # pub:copy:<platform>:<clip_id>
+        parts = data.split(":")
+        if len(parts) >= 4:
+            platform = parts[2]
+            cid = parts[3]
+        else:
+            platform = "snap"
+            cid = parts[-1] if parts else ""
+        clip = st.clips.get(cid)
+        if clip:
+            # Ensure description exists (V1) and persist it.
+            ensure_publish_description(clip)
+            _save_state_locked()
+            text = build_publish_text_from_clip(clip, platform=platform)
+            _tg_api("sendMessage", data={"chat_id": str(chat_id), "text": text})
+        return
     if data == "menu:settings":
         _settings_menu(chat_id)
         return
@@ -938,6 +1088,11 @@ def _handle_callback(chat_id: int, data: str):
             )
         return
 
+    if data.startswith("clip:delete:"):
+        cid = data.split(":")[-1]
+        _delete_clip_and_open_next(chat_id, cid)
+        return
+
 
 def _handle_message(chat_id: int, text: str):
     st = _state(chat_id)
@@ -1062,6 +1217,11 @@ def run():
 
 
 if __name__ == "__main__":
+    import os
+    import sys
+    if str(os.getenv("RUN_LEGACY_BOT", "")).strip() != "1":
+        print("Legacy bot disabled. Use: py -m bot.v3.main (set RUN_LEGACY_BOT=1 to run legacy).", flush=True)
+        sys.exit(2)
     with STATE_LOCK:
         _load_state()
     _startup_ready_and_restore()
