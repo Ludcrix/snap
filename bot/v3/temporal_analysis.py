@@ -86,6 +86,10 @@ def parse_relative_pub_time(raw_text: str, *, t_capture_utc: datetime) -> tuple[
             if age_s >= 0:
                 age_min = float(age_s) / 60.0
                 t_pub = t_capture_utc - timedelta(seconds=age_s)
+                try:
+                    print(f"[AGE][PARSE] AGE_SECONDS override found age_s={age_s}", flush=True)
+                except Exception:
+                    pass
                 return t_pub, age_min, "matched:age_seconds"
         except Exception:
             pass
@@ -115,8 +119,17 @@ def parse_relative_pub_time(raw_text: str, *, t_capture_utc: datetime) -> tuple[
             continue
 
         t_pub = t_capture_utc - delta
+        try:
+            print(f"[AGE][PARSE] matched relative unit={unit} n={n} age_min={age_min}", flush=True)
+        except Exception:
+            pass
         return t_pub, age_min, f"matched:{unit}"
 
+    try:
+        snippet = (raw_text[:120] + "...") if len(raw_text) > 120 else raw_text
+        print(f"[AGE][PARSE] no relative match for raw_text={snippet!r}", flush=True)
+    except Exception:
+        pass
     return None, None, "no_match"
 
 
@@ -474,7 +487,16 @@ def analyze_from_meta(*, meta: dict, t_capture_utc: datetime | None = None) -> T
             ocr_text = v.strip()
             break
 
+    try:
+        print(f"[AGE][ANALYZE] meta_keys={list(meta.keys())} ocr_text_sample={ (ocr_text or '')[:120]!r}", flush=True)
+    except Exception:
+        pass
+
     t_pub, age_min, pub_reason = parse_relative_pub_time(ocr_text or "", t_capture_utc=t_capture_utc)
+    try:
+        print(f"[AGE][ANALYZE] parse_result t_pub={t_pub} age_min={age_min} pub_reason={pub_reason}", flush=True)
+    except Exception:
+        pass
 
     ocr_metrics = meta.get("ocr_metrics")
     likes = shares = sends = saves = remixes = comments = views = None
@@ -591,8 +613,25 @@ def format_telegram_block(a: TemporalAnalysis) -> str:
         else:
             age_human = f"il y a {a.age_minutes / 60.0:.1f} h"
 
+    # If we have an absolute publication time, include the date (JJ/MM/AAAA)
+    date_str = None
+    try:
+        if getattr(a, "t_pub_utc", None):
+            dt = a.t_pub_utc
+            # Normalize and format as day/month/year
+            if getattr(dt, "tzinfo", None) is None:
+                from datetime import timezone
+
+                dt = dt.replace(tzinfo=timezone.utc)
+            date_str = dt.astimezone(timezone.utc).strftime("%d/%m/%Y")
+    except Exception:
+        date_str = None
+
     lines: list[str] = []
-    lines.append(f"📅 Publiée : {age_human}")
+    if date_str:
+        lines.append(f"📅 Publiée : {age_human} — {date_str}")
+    else:
+        lines.append(f"📅 Publiée : {age_human}")
     parts: list[str] = []
     parts.append(f"❤️ {_fmt_int(a.likes)}")
     parts.append(f"💬 {_fmt_int(a.comments)}")

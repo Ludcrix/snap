@@ -274,7 +274,15 @@ def _caption_for(v) -> str:
 
             meta2 = getattr(v, "meta", None)
             meta2 = dict(meta2) if isinstance(meta2, dict) else {}
+            try:
+                _log_tg(f"[AGE][CAPTION] vid={getattr(v, 'internal_id', None)} meta_keys={list(meta2.keys())} meta_sample={_short(str(meta2.get('ocr_raw_text') or meta2.get('ocr_pub') or ''), 120)!r}")
+            except Exception:
+                pass
             analysis = analyze_from_meta(meta=meta2)
+            try:
+                _log_tg(f"[AGE][CAPTION] vid={getattr(v, 'internal_id', None)} analysis.age_minutes={getattr(analysis, 'age_minutes', None)} analysis.stv={getattr(analysis, 'stv', None)} analysis.ocr_source={getattr(analysis, 'ocr_source', None)}")
+            except Exception:
+                pass
             block = format_telegram_block(analysis)
             if str(block or "").strip():
                 caption = caption + "\n\n" + block
@@ -808,6 +816,46 @@ def run() -> None:
                     if candidates:
                         cand = candidates[0]
                         before_mid = getattr(cand, "message_id", None)
+                        # Attempt to fetch reel age before sending preview so STV/Telegram block
+                        # can use an explicit AGE_SECONDS override discovered from Instagram.
+                        try:
+                            url = ""
+                            try:
+                                metau = dict(getattr(cand, "meta", {}) or {})
+                                url = str(metau.get("clipboard_url") or cand.source_url or "").strip()
+                            except Exception:
+                                url = str(getattr(cand, "source_url", "") or "")
+                            if url:
+                                try:
+                                    import created_time_test as _ctt
+
+                                    age_s = None
+                                    try:
+                                        age_s = _ctt.get_reel_age_seconds(url)
+                                    except Exception:
+                                        age_s = None
+                                    if age_s is not None:
+                                        try:
+                                            cand.meta = dict(getattr(cand, "meta", {}) or {})
+                                            # Persist both a machine-readable hint and explicit raw text
+                                            cand.meta["reel_age_seconds"] = int(age_s)
+                                            cand.meta["reel_created_ts"] = int(__import__("time").time()) - int(age_s)
+                                            # Inject an override that parse_relative_pub_time recognizes
+                                            old_raw = str(cand.meta.get("ocr_raw_text") or "").strip()
+                                            extra = f"AGE_SECONDS = {int(age_s)}"
+                                            cand.meta["ocr_raw_text"] = (old_raw + " " + extra).strip()
+                                            save_state_locked(cfg.state_file, st2)
+                                            try:
+                                                _log_tg(f"[AGE][PRE-SEND] vid={getattr(cand, 'internal_id', None)} url={url} age_s={int(age_s)}")
+                                            except Exception:
+                                                pass
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
                         _send_preview(cfg, st2, cand)
                         save_state_locked(cfg.state_file, st2)
 
@@ -1518,13 +1566,42 @@ def run() -> None:
                             _answer_cbq("Item introuvable")
                             continue
 
-                        # URL source: prefer meta clipboard_url, then source_url.
+                        # URL source resolution:
+                        # 1) try to extract the URL actually present in the Telegram message (most reliable for user-visible notif)
+                        # 2) fallback to stored meta.clipboard_url
+                        # 3) fallback to v.source_url
+                        import re
+
                         meta = getattr(v, "meta", None)
-                        url = ""
-                        if isinstance(meta, dict):
-                            url = str(meta.get("clipboard_url") or "").strip()
-                        if not url:
-                            url = str(getattr(v, "source_url", "") or "").strip()
+                        # message text/caption (may contain the URL shown in Telegram)
+                        old_msg_text = ""
+                        try:
+                            old_msg_text = str((msg_obj.get("text") or msg_obj.get("caption") or "") or "")
+                        except Exception:
+                            old_msg_text = ""
+                        url_from_msg = ""
+                        try:
+                            m = re.search(r"(https?://\S+)", old_msg_text)
+                            if m:
+                                url_from_msg = m.group(1).strip()
+                        except Exception:
+                            url_from_msg = ""
+
+                        url_clip = ""
+                        try:
+                            if isinstance(meta, dict):
+                                url_clip = str(meta.get("clipboard_url") or "").strip()
+                        except Exception:
+                            url_clip = ""
+
+                        url_src = str(getattr(v, "source_url", "") or "").strip()
+
+                        # choose first non-empty in order: url_from_msg, url_clip, url_src
+                        url = url_from_msg or url_clip or url_src
+                        try:
+                            print(f"[AGE][DBG] STV resolved URLs msg={url_from_msg!r} meta.clipboard={url_clip!r} stored={url_src!r} chosen={url!r}", flush=True)
+                        except Exception:
+                            pass
 
                         if not url:
                             print(f"[STV] no_url vid={vid}", flush=True)
@@ -1535,16 +1612,239 @@ def run() -> None:
 
                         try:
                             from ..stv_refresh import refresh_stv_from_url, strip_existing_stv_block
+                            from ..stv_age_api import fetch_created_time
 
-                            # Use the existing AndroidAgent instance if available.
-                            s_now = dict(getattr(st, "settings", {}) or {})
-                            res = refresh_stv_from_url(url, android_agent=deps.android_agent, settings=s_now)
+                            # First try the unified created-time extractor (Selenium -> HTML).
+                            try:
+                                try:
+                                    print(f"[AGE][DBG] STV handler pre-fetch vid={vid} source_url={getattr(v,'source_url',None)!r} meta_keys={list((getattr(v,'meta',{}) or {}).keys())} meta_reel_age={(getattr(v,'meta',{}) or {}).get('reel_age_seconds')}", flush=True)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                            age_res = None
+                            try:
+                                print(f"[AGE][DBG] calling fetch_created_time for url={url}", flush=True)
+                                age_res = fetch_created_time(url)
+                                print(f"[AGE][DBG] fetch_created_time returned: {age_res}", flush=True)
+                            except Exception as e:
+                                age_res = None
+                                try:
+                                    print(f"[AGE][DBG] fetch_created_time exception: {type(e).__name__}: {e}", flush=True)
+                                except Exception:
+                                    pass
+
+                            try:
+                                _log_tg(f"[AGE][STV] vid={vid} url={url} age_res={age_res}")
+                            except Exception:
+                                pass
+
+                            if age_res is not None:
+                                # Build a full temporal analysis using the discovered age.
+                                try:
+                                    from ..temporal_analysis import analyze_from_meta, format_telegram_block
+
+                                    meta2 = dict(getattr(v, "meta", {}) or {})
+                                    # Inject AGE_SECONDS token so parse_relative_pub_time honours the external age.
+                                    raw = str(meta2.get("ocr_raw_text") or "")
+                                    token = f"AGE_SECONDS = {int(age_res.age_seconds or 0)}"
+                                    if token not in raw:
+                                        if raw.strip():
+                                            meta2["ocr_raw_text"] = raw + "\n\n" + token
+                                        else:
+                                            meta2["ocr_raw_text"] = token
+
+                                    # Try to enrich meta2 with engagement metrics parsed from the HTML
+                                    try:
+                                        from ..stv_age_api import try_fetch_metrics_from_html
+                                        import urllib.request
+
+                                        html = None
+                                        try:
+                                            req = urllib.request.Request(str(url), headers={"User-Agent": "snap-bot/1.0"})
+                                            with urllib.request.urlopen(req, timeout=5.0) as fh:
+                                                raw = fh.read() or b""
+                                            html = raw.decode("utf-8", errors="replace")
+                                        except Exception:
+                                            html = None
+
+                                        if html:
+                                            metrics = try_fetch_metrics_from_html(html)
+                                            if isinstance(metrics, dict) and metrics:
+                                                meta2["ocr_metrics"] = metrics
+                                                # also set legacy individual keys
+                                                if "likes" in metrics:
+                                                    meta2["ocr_likes"] = metrics.get("likes")
+                                                if "comments" in metrics:
+                                                    meta2["ocr_comments"] = metrics.get("comments")
+                                                if "views" in metrics:
+                                                    meta2["ocr_views"] = metrics.get("views")
+                                    except Exception:
+                                        pass
+
+                                    # If no metrics were found in HTML, fall back to the heavy OCR refresh to obtain them.
+                                    if not isinstance(meta2.get("ocr_metrics"), dict) or not meta2.get("ocr_metrics"):
+                                        try:
+                                            s_now = dict(getattr(st, "settings", {}) or {})
+                                            refresh_res = refresh_stv_from_url(v, url, android_agent=deps.android_agent, settings=s_now)
+                                            # If refresh produced OCR metrics, merge them
+                                            if getattr(refresh_res, "raw_ocr_text", None):
+                                                meta2["ocr_raw_text"] = (meta2.get("ocr_raw_text") or "") + "\n\n" + getattr(refresh_res, "raw_ocr_text")
+                                            # attempt to parse metrics from the refresh debug if provided
+                                            try:
+                                                dbg = getattr(refresh_res, "debug", "") or ""
+                                                # no-op here; analyze_from_meta will parse ocr_raw_text if present
+                                            except Exception:
+                                                pass
+                                        except Exception:
+                                            pass
+
+                                    analysis = analyze_from_meta(meta=meta2)
+                                    block = format_telegram_block(analysis)
+                                    # Ensure absolute date is present when we have an external age
+                                    try:
+                                        if age_res and getattr(age_res, 'age_seconds', None) is not None:
+                                            from datetime import datetime, timezone, timedelta
+
+                                            dt_pub = datetime.now(timezone.utc) - timedelta(seconds=int(age_res.age_seconds))
+                                            date_str = dt_pub.astimezone(timezone.utc).strftime("%d/%m/%Y")
+                                            # insert date into the published line if missing
+                                            try:
+                                                ls = [ln for ln in block.splitlines()]
+                                                for i_l, ln in enumerate(ls):
+                                                    if ln.strip().startswith("📅 Publiée"):
+                                                        if date_str not in ln:
+                                                            ls[i_l] = ln + f" — {date_str}"
+                                                            block = "\n".join(ls)
+                                                        break
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+
+                                    class _SimpleRes:
+                                        pass
+
+                                    res = _SimpleRes()
+                                    res.ok = True
+                                    res.telegram_block = block
+                                    res.debug = "created_time_full_analysis"
+                                except Exception:
+                                    # Fallback to the simple block if analysis fails.
+                                    s = int(age_res.age_seconds or 0)
+                                    if s < 60:
+                                        human = f"{s}s"
+                                    elif s < 3600:
+                                        human = f"{s//60}m"
+                                    elif s < 86400:
+                                        human = f"{s//3600}h"
+                                    else:
+                                        human = f"{s//86400}d"
+                                    block = f"📅 Publiée : ~{human} (source={age_res.source})"
+                                    try:
+                                        from datetime import datetime, timezone, timedelta
+                                        dt_pub = datetime.now(timezone.utc) - timedelta(seconds=int(age_res.age_seconds or 0))
+                                        date_str = dt_pub.astimezone(timezone.utc).strftime("%d/%m/%Y")
+                                        block = block + f" — {date_str}"
+                                    except Exception:
+                                        pass
+                                    class _SimpleRes2:
+                                        pass
+
+                                    res = _SimpleRes2()
+                                    res.ok = True
+                                    res.telegram_block = block
+                                    res.debug = "created_time_only_fallback"
+                            else:
+                                # Use the existing STV refresh (OCR/ADB) when created-time isn't found.
+                                s_now = dict(getattr(st, "settings", {}) or {})
+                                # refresh_stv_from_url expects (video, url, ...)
+                                try:
+                                    res = refresh_stv_from_url(v, url, android_agent=deps.android_agent, settings=s_now)
+                                except Exception as e:
+                                    try:
+                                        print(f"[AGE][REFRESH] refresh_stv_from_url exception url={url} err={type(e).__name__}:{e}", flush=True)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        from ..stv_refresh import StvRefreshResult
+
+                                        res = StvRefreshResult(False, telegram_block="", debug=f"exception:{type(e).__name__}:{e}")
+                                    except Exception:
+                                        class _FallbackRes:
+                                            pass
+
+                                        res = _FallbackRes()
+                                        res.ok = False
+                                        res.telegram_block = ""
+                                        res.debug = f"exception:{type(e).__name__}:{e}"
+
+                                # If OCR was unavailable during refresh, try a plain-HTML fallback
+                                # to at least recover a creation time without OCR/Tesseract.
+                                try:
+                                    # Defensive: ensure `res` is not None and has expected attributes.
+                                    if res is None:
+                                        try:
+                                            print(f"[AGE][REFRESH] warning: res is None after refresh for url={url}", flush=True)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            from ..stv_refresh import StvRefreshResult
+
+                                            res = StvRefreshResult(False, telegram_block="", debug="res_none_after_refresh")
+                                        except Exception:
+                                            class _FallbackRes2:
+                                                pass
+
+                                            res = _FallbackRes2()
+                                            res.ok = False
+                                            res.telegram_block = ""
+                                            res.debug = "res_none_after_refresh"
+
+                                    tb = str(getattr(res, "telegram_block", "") or "")
+                                    debug_s = str(getattr(res, "debug", "") or "")
+
+                                    if (not bool(getattr(res, "ok", False))) and (
+                                        "OCR indisponible" in tb or "OCR indisponible" in debug_s or "ocr" in debug_s.lower()
+                                    ):
+                                        try:
+                                            from ..stv_age_api import try_fetch_age_from_html
+
+                                            alt = try_fetch_age_from_html(url)
+                                            if alt is not None:
+                                                s2 = int(alt.age_seconds or 0)
+                                                if s2 < 60:
+                                                    human2 = f"{s2}s"
+                                                elif s2 < 3600:
+                                                    human2 = f"{s2//60}m"
+                                                elif s2 < 86400:
+                                                    human2 = f"{s2//3600}h"
+                                                else:
+                                                    human2 = f"{s2//86400}d"
+                                                block2 = f"📅 Publiée : ~{human2} (source={alt.source})"
+                                                class _SimpleRes2:
+                                                    pass
+
+                                                res = _SimpleRes2()
+                                                res.ok = True
+                                                res.telegram_block = block2
+                                                res.debug = (getattr(res, "debug", "") or "") + ";html_fallback_after_ocr"
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
 
                             # Rebuild message text by appending refreshed block (no storage change).
-                            old_text = ""
-                            if isinstance(msg_obj, dict):
-                                old_text = str(msg_obj.get("text") or msg_obj.get("caption") or "")
-                            base_text = strip_existing_stv_block(old_text)
+                            # Prefer authoritative caption from storage (`_caption_for(v)`) so we keep
+                            # all metadata and formatting. Fallback to the message object if needed.
+                            try:
+                                base_text = strip_existing_stv_block(_caption_for(v))
+                            except Exception:
+                                old_text = ""
+                                if isinstance(msg_obj, dict):
+                                    old_text = str(msg_obj.get("text") or msg_obj.get("caption") or "")
+                                base_text = strip_existing_stv_block(old_text)
                             new_text = (base_text + "\n\n" + str(res.telegram_block or "").strip()).strip()
 
                             kb = _preview_keyboard(vid)

@@ -757,6 +757,40 @@ class SessionManager:
         item.title = generate_title(score=item.score, reason=item.reason, source_url=item.source_url)
         item.hashtags = generate_hashtags(score_details=item.score_details)
 
+        # Attempt to fetch created-time now (best-effort) and persist into meta so
+        # subsequent flows (Telegram preview, STV) can reuse it without re-querying.
+        try:
+            url_try = str((item.meta.get("clipboard_url") if isinstance(item.meta, dict) else None) or item.source_url or "").strip()
+            if url_try:
+                try:
+                    from .stv_age_api import fetch_created_time
+
+                    age_res = None
+                    try:
+                        print(f"[AGE][SESSION] attempting fetch_created_time for url={url_try}", flush=True)
+                        age_res = fetch_created_time(url_try)
+                        print(f"[AGE][SESSION] fetch_created_time -> {age_res}", flush=True)
+                    except Exception as e:
+                        age_res = None
+                        try:
+                            print(f"[AGE][SESSION] fetch_created_time exception: {type(e).__name__}: {e}", flush=True)
+                        except Exception:
+                            pass
+                    if age_res is not None:
+                        try:
+                            item.meta = dict(item.meta or {})
+                            item.meta["reel_age_seconds"] = int(age_res.age_seconds or 0)
+                            item.meta["reel_created_ts"] = int(time.time()) - int(age_res.age_seconds or 0)
+                            # Inject an override token so parse_relative_pub_time will pick it up.
+                            old_raw = str(item.meta.get("ocr_raw_text") or "").strip()
+                            item.meta["ocr_raw_text"] = (old_raw + " AGE_SECONDS = %d" % int(age_res.age_seconds or 0)).strip()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Persist immediately.
         st.videos[item.internal_id] = item
 
